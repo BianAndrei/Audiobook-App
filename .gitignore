@@ -1,0 +1,6 @@
+.run/
+__pycache__/
+.DS_Store
+# Personal books are not published; keep the folder itself
+Books/*
+!Books/.gitkeep
