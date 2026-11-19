@@ -22,20 +22,25 @@ from functools import partial
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("BOOKSHELF_PORT", "4173"))
 KOKORO_HOST = "127.0.0.1"  # fixed upstream: never derived from the request (no SSRF)
 KOKORO_PORT = int(os.environ.get("KOKORO_PORT", "8880"))
 
-BOOKS_DIR = ROOT / "Books"
+BOOKS_DIR = Path(os.environ.get("BOOKSHELF_BOOKS", ROOT / "Books")).resolve()
 STATIC_DIRS = tuple(ROOT / d for d in ("styles", "js", "vendor", "assets", "samples"))
 BOOK_EXTENSIONS = {".epub", ".pdf", ".txt"}
 ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
 ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
 
 MAX_TTS_BODY = 16 * 1024
+MAX_STATE_BODY = 8 * 1024 * 1024        # reading positions, notes, stats, settings
+MAX_UPLOAD_BODY = 300 * 1024 * 1024     # one book file
+STATE_FILE = BOOKS_DIR / ".bookshelf-state.json"
+STATE_LOCK = threading.Lock()
+UPLOAD_LOCK = threading.Lock()
 MAX_TTS_INPUT = 2000
 VOICE_RE = re.compile(r"^[a-z]{2}_[a-z0-9_]{1,40}$")
 SYNTH_LOCK = threading.Lock()
@@ -139,11 +144,15 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"ok": True, "kokoro": kokoro_alive()})
         if path == "api/books":
             return self.send_json({"books": list_books()})
+        if path == "api/state":
+            return self.send_json(read_state())
         if path == "api/tts/voices":
             return self.proxy("GET", "/v1/audio/voices", None)
         target = self.static_target(path)
         if target is None:
             return self.send_error(HTTPStatus.NOT_FOUND)
+        if not target.is_relative_to(ROOT):  # a Books folder kept elsewhere (BOOKSHELF_BOOKS)
+            return self.send_file(target, head)
         # Hand the vetted absolute path to the stock implementation (handles 304s, ranges of headers).
         self.path = "/" + quote(str(target.relative_to(ROOT)))
         if head:
@@ -151,22 +160,54 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def send_file(self, target: Path, head: bool):
+        try:
+            f = open(target, "rb")
+        except OSError:
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        with f:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", self.guess_type(str(target)))
+            self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+            self.end_headers()
+            if not head:
+                self.copyfile(f, self.wfile)
+
     def do_POST(self):
         if not self.host_ok():
             return
         origin = self.headers.get("Origin")
         if origin is not None and origin not in ALLOWED_ORIGINS:
             return self.send_error(HTTPStatus.FORBIDDEN, "Invalid origin")
-        if urlsplit(self.path).path != "/api/tts/speech":
-            return self.send_error(HTTPStatus.NOT_FOUND)
-        if not self.headers.get("Content-Type", "").startswith("application/json"):
-            return self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        url = urlsplit(self.path)
+        if url.path == "/api/tts/speech":
+            return self.post_speech()
+        # Endpoints that write files additionally require a same-origin browser request.
+        if origin is None:
+            return self.send_error(HTTPStatus.FORBIDDEN, "Missing origin")
+        if url.path == "/api/state":
+            return self.post_state()
+        if url.path == "/api/books/upload":
+            return self.post_upload(parse_qs(url.query).get("name", [""])[0])
+        return self.send_error(HTTPStatus.NOT_FOUND)
+
+    def body_length(self, limit: int) -> int | None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return self.send_error(HTTPStatus.BAD_REQUEST)
-        if length <= 0 or length > MAX_TTS_BODY:
-            return self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return None
+        if length <= 0 or length > limit:
+            self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return None
+        return length
+
+    def post_speech(self):
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        length = self.body_length(MAX_TTS_BODY)
+        if length is None:
+            return
         try:
             data = json.loads(self.rfile.read(length))
             payload = validate_speech(data)
@@ -180,6 +221,53 @@ class Handler(SimpleHTTPRequestHandler):
                 self.close_connection = True
                 return
             self.proxy("POST", "/v1/audio/speech", json.dumps(payload).encode("utf-8"))
+
+    def post_state(self):
+        """Save the app's reading state (positions, notes, stats, settings) next to the books."""
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        length = self.body_length(MAX_STATE_BODY)
+        if length is None:
+            return
+        try:
+            data = json.loads(self.rfile.read(length))
+        except ValueError:
+            return self.send_json({"error": "Invalid JSON."}, HTTPStatus.BAD_REQUEST)
+        if not isinstance(data, dict):
+            return self.send_json({"error": "State must be an object."}, HTTPStatus.BAD_REQUEST)
+        write_state(data)
+        return self.send_json({"ok": True})
+
+    def post_upload(self, raw_name: str):
+        """Keep a copy of a book added in the app inside the Books folder."""
+        name = safe_book_name(raw_name)
+        if name is None:
+            return self.send_json({"error": "Unsupported file name."}, HTTPStatus.BAD_REQUEST)
+        length = self.body_length(MAX_UPLOAD_BODY)
+        if length is None:
+            return
+        BOOKS_DIR.mkdir(exist_ok=True)
+        tmp = BOOKS_DIR / f".upload-{threading.get_ident()}.part"
+        try:
+            with open(tmp, "wb") as out:
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        raise OSError("connection closed")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            with UPLOAD_LOCK:
+                target = unique_book_path(name, tmp)
+                if target.exists():  # identical file already there
+                    tmp.unlink()
+                else:
+                    os.replace(tmp, target)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            return self.send_json({"error": "Could not save the file."}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        stat = target.stat()
+        return self.send_json({"name": target.name, "size": stat.st_size, "mtime": int(stat.st_mtime)})
 
     def client_gone(self) -> bool:
         try:
@@ -238,6 +326,55 @@ def kokoro_alive() -> bool:
         return False
     finally:
         conn.close()
+
+
+def read_state() -> dict:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(data: dict) -> None:
+    BOOKS_DIR.mkdir(exist_ok=True)
+    with STATE_LOCK:  # write-then-rename so a crash never leaves half a file
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, STATE_FILE)
+
+
+def safe_book_name(raw: str) -> str | None:
+    """A plain file name (no folders, no hidden files) with a book extension."""
+    name = re.sub(r"[\x00-\x1f\x7f/\\:]", "", raw).strip()
+    if not name or name.startswith(".") or len(name.encode("utf-8")) > 200:
+        return None
+    if Path(name).suffix.lower() not in BOOK_EXTENSIONS or Path(name).name != name:
+        return None
+    return name
+
+
+def same_file(a: Path, b: Path) -> bool:
+    if a.stat().st_size != b.stat().st_size:
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(1 << 20), fb.read(1 << 20)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def unique_book_path(name: str, data: Path) -> Path:
+    """Books/<name>, or Books/<name> (2) … when a different file already uses the name.
+    Returns an existing path only when that file is identical to `data`."""
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for n in range(1, 1000):
+        candidate = BOOKS_DIR / (name if n == 1 else f"{stem} ({n}){suffix}")
+        if not candidate.exists() or same_file(candidate, data):
+            return candidate
+    raise OSError("too many copies")
 
 
 def list_books() -> list[dict]:

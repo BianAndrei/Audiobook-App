@@ -171,14 +171,15 @@ def stop_kokoro():
 
 
 def open_app():
-    """Open Bookshelf in its own window: the installed app if present, else a Chrome app window."""
-    installed = [Path.home() / "Applications" / "Chrome Apps.localized" / "Bookshelf.app",
-                 Path.home() / "Applications" / "Bookshelf.app"]
-    for app in installed:
-        if app.is_dir():
-            subprocess.run(["open", "-a", str(app)], check=False)
-            return
-    if Path("/Applications/Google Chrome.app").is_dir():
+    """Open Bookshelf in its own window: the Mac app if built, else a Chrome app window."""
+    native = Path.home() / "Applications" / "Bookshelf.app"
+    if (native / "Contents" / "MacOS" / "Bookshelf").is_file():  # built by scripts/make-dock-app.sh
+        subprocess.run(["open", str(native)], check=False)
+        return
+    pwa = Path.home() / "Applications" / "Chrome Apps.localized" / "Bookshelf.app"
+    if pwa.is_dir():
+        subprocess.run(["open", "-a", str(pwa)], check=False)
+    elif Path("/Applications/Google Chrome.app").is_dir():
         subprocess.run(["open", "-na", "Google Chrome", "--args", f"--app={URL}"], check=False)
     else:
         subprocess.run(["open", URL], check=False)
@@ -206,10 +207,12 @@ def main(argv: list[str]) -> int:
         if cmd == "stop" and "--keep-voice" not in flags:
             stop_kokoro()
     if cmd in ("start", "restart"):
-        voice = start_kokoro()
+        # Open the window first (the library works right away); the narrator warms up after,
+        # and the app's status dot turns green by itself once Kokoro answers.
         reader = start_reader()
         if reader and "--no-open" not in flags:
             open_app()
+        voice = start_kokoro()
         if reader and not voice:
             print("  The library works without Kokoro, but narration needs it.")
         return 0 if reader else 1

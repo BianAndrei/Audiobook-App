@@ -1,10 +1,10 @@
 // Bookshelf service worker: keeps the app shell available so the installed app opens even
 // when the local server is stopped (books live in IndexedDB; narration needs the server).
-const VERSION = "bookshelf-v1";
+const VERSION = "bookshelf-v2";
 const SHELL = [
   "/", "/manifest.webmanifest", "/styles/app.css",
   "/js/ui-controller.js", "/js/reader-view.js", "/js/library-view.js", "/js/tts-engine.js",
-  "/js/book-parser.js", "/js/storage.js", "/js/text-utils.js",
+  "/js/book-parser.js", "/js/storage.js", "/js/sync.js", "/js/text-utils.js",
   "/vendor/jszip.min.js", "/vendor/pdfjs/pdf.min.mjs", "/vendor/pdfjs/pdf.worker.min.mjs",
   "/assets/icon.svg", "/assets/icons/icon-192.png", "/assets/icons/icon-512.png",
   "/assets/fonts/eb-garamond-latin-400-normal.woff2", "/assets/fonts/literata-latin-400-normal.woff2",

@@ -1,6 +1,7 @@
 // Application controller: library, importing, reader, narration, popovers, reading goals.
 
 import * as db from "./storage.js";
+import * as sync from "./sync.js";
 import { parseBookFile, fileId, summarise, makeThumbnail } from "./book-parser.js";
 import { TTSEngine, CURATED_VOICES, describeVoice } from "./tts-engine.js";
 import { ReaderView } from "./reader-view.js";
@@ -205,6 +206,7 @@ async function doImport(file, source, quiet) {
       ...summarise(parsed.chapters),
     };
     await db.saveImportedBook(record, { chapters: parsed.chapters }, parsed.images);
+    if (source === "import") keepInBooksFolder(file);
     if (!quiet) toast(`Added “${record.title}”.`);
     return record;
   } catch (error) {
@@ -215,6 +217,19 @@ async function doImport(file, source, quiet) {
     library.setImporting(key, null);
     await refreshLibrary();
   }
+}
+
+/** Books added by drag-and-drop or "Add Book" also get a copy in the Books folder. */
+async function keepInBooksFolder(file) {
+  try {
+    const res = await fetch(`/api/books/upload?name=${encodeURIComponent(file.name)}`, {
+      method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file,
+    });
+    if (!res.ok) return;
+    const entry = await res.json();
+    const seen = await db.getKV("folderSeen", []);
+    await db.setKV("folderSeen", [...seen, `${entry.name}|${entry.size}|${entry.mtime}`]);
+  } catch { /* the library still has the book */ }
 }
 
 let syncing = false;
@@ -275,7 +290,7 @@ function bookMenu(book, anchor) {
 
 async function markBook(book, patch) {
   closePopover();
-  await db.updateBook(book.id, patch);
+  await db.updateBook(book.id, { ...patch, changedAt: Date.now() });
   await refreshLibrary();
 }
 
@@ -310,7 +325,9 @@ async function openBook(book, coverEl) {
   state.annotations = await db.getAnnotations(book.id);
   state.lastTurn = Date.now();
   state.pagePos = null;
+  state.pageAnchor = null;
   const at = validLoc(state.book.progress) || { c: 0, s: 0 };
+  const page = validLoc(state.book.page);
   state.cursor = at;
 
   const readerEl = $("reader");
@@ -318,7 +335,7 @@ async function openBook(book, coverEl) {
   readerEl.classList.add("entering");
   applyChrome();
   $("reader-title").textContent = state.book.title;
-  await reader.open(state.book, state.chapters, state.settings, at);
+  await reader.open(state.book, state.chapters, state.settings, page?.c === at.c ? page : at);
   reader.setAnnotations(state.annotations);
   tts.current = at;
   tts.warmUp(state.settings.voice);
@@ -326,6 +343,7 @@ async function openBook(book, coverEl) {
   $("library").hidden = true;
   readerEl.classList.remove("entering");
   db.updateBook(book.id, { openedAt: Date.now() }).catch(() => {});
+  db.setKV("session", { bookId: book.id, at: Date.now() }).catch(() => {});
   updatePlayerTime();
   wakeChrome();
 }
@@ -366,6 +384,7 @@ async function closeBook() {
   flushStats();
   reader.close();
   state.book = null;
+  db.setKV("session", { bookId: null, at: Date.now() }).catch(() => {});
   $("library").hidden = false;
   $("reader").hidden = true;
   $("follow-chip").hidden = true;
@@ -389,7 +408,10 @@ async function saveProgressNow() {
   if (!loc) return;
   const total = Math.max(1, book.totalSentences - 1);
   let percent = Math.min(100, globalIndex(loc) / total * 100);
-  const patch = { progress: loc, percent, openedAt: Date.now() };
+  const page = !tts.isActive && state.pageAnchor?.c === loc.c ? state.pageAnchor : null;
+  const same = (a, b) => (a?.c ?? -1) === (b?.c ?? -1) && (a?.s ?? -1) === (b?.s ?? -1);
+  if (same(loc, book.progress) && same(page, book.page)) return;
+  const patch = { progress: loc, page, percent, openedAt: Date.now(), changedAt: Date.now() };
   const atEnd = loc.c === state.chapters.length - 1 && reader.view >= reader.viewCount - 1 && !reader.isScroll;
   if ((percent >= 99.5 || atEnd) && !book.finishedAt) {
     patch.finishedAt = Date.now();
@@ -401,9 +423,10 @@ async function saveProgressNow() {
 }
 const saveProgress = throttle(saveProgressNow, 1500);
 
-function onPage({ c, s }) {
+function onPage({ c, s, anchor }) {
   const prev = state.pagePos;
   state.pagePos = { c, s };
+  state.pageAnchor = { c, s: anchor ?? s };
   if (!tts.isActive) state.cursor = { c, s };
   $("reader-chapter").textContent = state.chapters[c]?.title || "";
   updateBookmarkButton();
@@ -1012,7 +1035,6 @@ async function toggleBookmark() {
     const s = reader.firstVisibleSentence();
     const note = { bookId: state.book.id, kind: "bookmark", c: reader.chapter, s, excerpt: (state.flat[reader.chapter][s]?.text || "").slice(0, 220) };
     note.id = await db.addAnnotation(note);
-    note.createdAt = Date.now();
     state.annotations.push(note);
   }
   updateBookmarkButton();
@@ -1065,7 +1087,6 @@ async function saveHighlight({ c, s, e, color, existing, note }) {
   } else {
     const record = { bookId: state.book.id, kind: "highlight", c, s, e, color: color || "amber", note: note || "", excerpt };
     record.id = await db.addAnnotation(record);
-    record.createdAt = Date.now();
     state.annotations.push(record);
   }
   reader.setAnnotations(state.annotations);
@@ -1240,7 +1261,7 @@ function flushStats() {
   db.bumpStats(dayKey(), delta).catch(() => {});
   db.setKV("calibration", { wpm1: state.wpm1, readWpm: state.readWpm }).catch(() => {});
 }
-for (const type of ["pointerdown", "keydown", "wheel"]) addEventListener(type, () => { state.lastActivity = Date.now(); }, { passive: true });
+for (const type of ["pointerdown", "keydown", "wheel"]) addEventListener(type, () => { state.lastActivity = Date.now(); state.touched = true; }, { passive: true });
 addEventListener("pagehide", () => { flushStats(); saveProgressNow(); });
 document.addEventListener("visibilitychange", () => { if (document.hidden) { flushStats(); saveProgressNow(); } });
 
@@ -1343,16 +1364,67 @@ async function init() {
   }
   tts.voice = state.settings.voice;
   tts.speed = state.settings.speed;
+  sync.start();
+  await applySynced(await sync.now());
   applyChrome();
   renderVoice();
   await refreshLibrary();
+  await restoreSession();
   db.requestPersistence();
-  checkKokoro().then(ok => { if (ok) tts.warmUp(state.settings.voice); });
-  setInterval(checkKokoro, 20000);
+  // Poll quickly while the narrator is still starting, slowly once it is up.
+  const poll = async () => {
+    const ok = await checkKokoro();
+    if (ok) tts.warmUp(state.settings.voice);
+    setTimeout(poll, ok ? 20000 : 3000);
+  };
+  poll();
   loadVoices();
   await importSampleOnce();
   await syncBooksFolder();
-  addEventListener("focus", () => syncBooksFolder());
+  // A first start on this computer: books from the folder are only just in; adopt the saved
+  // positions and, if nothing was clicked meanwhile, reopen the book that was open.
+  await applySynced(await sync.now());
+  if (!state.book && !state.touched) await restoreSession();
+  addEventListener("focus", async () => { await syncBooksFolder(); await applySynced(await sync.now()); });
+}
+
+/** Re-open the book that was open when the app was last closed, on the same page. */
+async function restoreSession() {
+  const session = await db.getKV("session").catch(() => null);
+  if (!session?.bookId || state.book) return;
+  const book = state.books.find(b => b.id === session.bookId);
+  if (book) await openBook(book);
+}
+
+/** Apply what a sync brought in from another window or an earlier install. */
+async function applySynced(changes) {
+  if (!changes) return;
+  if (changes.settings) {
+    state.settings = sanitiseSettings(changes.settings);
+    tts.voice = state.settings.voice;
+    tts.speed = state.settings.speed;
+    if (state.book) await reader.updateSettings(state.settings);
+    applyChrome();
+    renderVoice();
+  }
+  if (state.book && changes.notes) {
+    state.annotations = await db.getAnnotations(state.book.id);
+    reader.setAnnotations(state.annotations);
+  }
+  if (changes.books) {
+    // The open book moved on elsewhere (and isn't being read aloud here): follow it.
+    if (state.book && !tts.isActive) {
+      const fresh = await db.getBook(state.book.id);
+      const at = fresh && validLoc(fresh.progress);
+      if (at && (at.c !== state.cursor?.c || at.s !== state.cursor?.s) && fresh.changedAt > (state.book.changedAt || 0)) {
+        state.book = fresh;
+        state.cursor = at;
+        const page = validLoc(fresh.page);
+        await reader.reveal(at.c, (page?.c === at.c ? page : at).s, { animate: false });
+      }
+    }
+    await refreshLibrary();
+  }
 }
 
 // ---------------------------------------------------------- installable app
@@ -1388,4 +1460,12 @@ if ("launchQueue" in window) {
 
 init();
 
-window.bookshelf = { state, tts, reader, library };
+window.bookshelf = {
+  state, tts, reader, library,
+  /** Save everything now (the Mac app calls this right before it quits). */
+  async flush() {
+    flushStats();
+    await saveProgressNow();
+    await sync.now();
+  },
+};

@@ -56,6 +56,11 @@ export async function requestPersistence() {
   try { if (navigator.storage?.persist) await navigator.storage.persist(); } catch { /* optional */ }
 }
 
+// ---- change notifications (the sync module listens) ----------------------
+const listeners = new Set();
+export const onChange = fn => listeners.add(fn);
+const changed = what => { for (const fn of listeners) { try { fn(what); } catch { /* listener bug */ } } };
+
 // ---- books ---------------------------------------------------------------
 export const getAllBooks = () => tx("books", "readonly", t => promisify(t.objectStore("books").getAll()));
 export const getBook = id => tx("books", "readonly", t => promisify(t.objectStore("books").get(id)));
@@ -69,7 +74,7 @@ export async function updateBook(id, patch) {
     Object.assign(book, patch);
     store.put(book);
     return book;
-  });
+  }).then(book => { changed("books"); return book; });
 }
 
 export async function saveImportedBook(book, content, images) {
@@ -102,10 +107,34 @@ export async function deleteBook(id) {
 // ---- annotations (bookmarks, highlights, notes) --------------------------
 export const getAnnotations = bookId =>
   tx("annotations", "readonly", t => promisify(t.objectStore("annotations").index("bookId").getAll(bookId)));
-export const addAnnotation = note =>
-  tx("annotations", "readwrite", t => promisify(t.objectStore("annotations").add({ ...note, createdAt: Date.now() })));
-export const putAnnotation = note => tx("annotations", "readwrite", t => promisify(t.objectStore("annotations").put(note)));
-export const deleteAnnotation = id => tx("annotations", "readwrite", t => promisify(t.objectStore("annotations").delete(id)));
+export const getAllAnnotations = () => tx("annotations", "readonly", t => promisify(t.objectStore("annotations").getAll()));
+/** Stable identity of a note across devices/windows (local ids are per-database). */
+export const noteKey = note => `${note.bookId}|${note.createdAt}`;
+
+export async function addAnnotation(note) {
+  // Stamped on the caller's object too, so in-memory copies keep the same identity (noteKey).
+  note.createdAt = note.updatedAt = Date.now();
+  const id = await tx("annotations", "readwrite", t => promisify(t.objectStore("annotations").add({ ...note })));
+  changed("annotations");
+  return id;
+}
+export async function putAnnotation(note, { touch = true } = {}) {
+  if (touch) note.updatedAt = Date.now();
+  const id = await tx("annotations", "readwrite", t => promisify(t.objectStore("annotations").put(note)));
+  changed("annotations");
+  return id;
+}
+export async function deleteAnnotation(id, { remember = true } = {}) {
+  const note = await tx("annotations", "readwrite", async t => {
+    const store = t.objectStore("annotations");
+    const row = await promisify(store.get(id));
+    store.delete(id);
+    return row;
+  });
+  // Remember the deletion so other windows don't bring the note back.
+  if (note && remember) await setKV("deletedNotes", [...(await getKV("deletedNotes", [])), noteKey(note)].slice(-2000));
+  changed("annotations");
+}
 
 // ---- reading stats -------------------------------------------------------
 export const getAllStats = () => tx("stats", "readonly", t => promisify(t.objectStore("stats").getAll()));
@@ -117,12 +146,16 @@ export async function bumpStats(day, delta) {
     for (const key of ["read", "listen", "pages", "words"]) row[key] += Number(delta[key]) || 0;
     store.put(row);
     return row;
-  });
+  }).then(row => { changed("stats"); return row; });
 }
+export const putStats = row => tx("stats", "readwrite", t => promisify(t.objectStore("stats").put(row)));
 
 // ---- key/value (settings, folder sync, calibration) ----------------------
 export async function getKV(key, fallback = null) {
   const row = await tx("kv", "readonly", t => promisify(t.objectStore("kv").get(key)));
   return row ? row.value : fallback;
 }
-export const setKV = (key, value) => tx("kv", "readwrite", t => promisify(t.objectStore("kv").put({ key, value })));
+export async function setKV(key, value) {
+  await tx("kv", "readwrite", t => promisify(t.objectStore("kv").put({ key, value })));
+  changed(`kv:${key}`);
+}

@@ -4,7 +4,9 @@ A private, offline ebook reader and AI audiobook narrator with a clean, modern, 
 
 ## Start and stop
 
-Double-click **`Start Classic Bookshelf.command`** in Finder. It starts the narrator and the local server and opens Bookshelf in its own window. To shut everything down, double-click **`Stop Classic Bookshelf.command`**.
+Click **Bookshelf** in your Dock (see *Mac app* below). Quitting it (**⌘Q**, or closing its window) saves your place and stops the reader and the narrator.
+
+Without the Mac app: double-click **`Start Classic Bookshelf.command`** in Finder to start the narrator and the local server and open Bookshelf; **`Stop Classic Bookshelf.command`** shuts everything down.
 
 Or use the terminal, from this folder:
 
@@ -17,7 +19,18 @@ Or use the terminal, from this folder:
 
 The app address is **http://localhost:4173**. It is reachable only from this computer.
 
-## Install as an app (Dock icon)
+## Mac app
+
+`./scripts/make-dock-app.sh` builds **`~/Applications/Bookshelf.app`** and pins it to your Dock. It's a small native app (`mac/Bookshelf.swift`, compiled with Apple's command line tools), not a browser window:
+
+- It has its own window, Dock icon, menu bar and **⌘Q**, separate from Chrome.
+- Opening it starts the local server and the narrator. The library shows right away, and the narrator dot turns green once Kokoro is ready (about 30 s after a cold start).
+- It reopens the book you had open, on the same page. If you were in the library, it opens the library.
+- Quitting saves your place, then stops the reader and Kokoro to free memory.
+
+The first time, macOS may ask whether Bookshelf may access your Downloads folder (where this project lives); click **OK**. Run the script again if you move this folder or change `mac/Bookshelf.swift`.
+
+## Install as a Chrome web app (alternative)
 
 1. Start Bookshelf once (above).
 2. In **Google Chrome**, click **Install App** at the bottom of the sidebar (or the install icon in the address bar). Bookshelf then appears in your Dock, Launchpad and `~/Applications/Chrome Apps`, with its own window and icon.
@@ -26,11 +39,11 @@ The app address is **http://localhost:4173**. It is reachable only from this com
 4. You can open the app even when the server is stopped. Your library and reading still work; narration and the `Books/` folder sync need **Start** first.
 5. To open an EPUB, PDF or TXT with Bookshelf from Finder, right-click it → **Open With → Bookshelf** (Chrome-installed app).
 
-Your books stay in this folder's `Books/`, and your library (progress, notes, highlights) stays in the browser's storage on this Mac.
+Your books stay in this folder's `Books/`. Your place in each book, notes, highlights, reading stats and settings are also saved in `Books/.bookshelf-state.json`, so the Mac app, a browser tab and a fresh install all pick up where you left off.
 
 ## Adding books
 
-- Drag EPUB, PDF or TXT files onto the window, or click **Add Books**.
+- Drag EPUB, PDF or TXT files onto the window, or click **Add Books**. A copy goes into the **`Books/`** folder.
 - Or copy files into the **`Books/`** folder here. They appear on the shelf automatically the next time the app opens or regains focus.
 - EPUB covers and illustrations are extracted. A PDF's first page becomes its cover. Books without art get a clean generated cover with the title.
 - PDFs need a text layer. Scanned image-only PDFs must be OCR'd first.
@@ -79,7 +92,7 @@ Browser (index.html, js/*)  ──►  server.py :4173  ──►  Kokoro-FastAP
 - **`js/book-parser.js`** turns EPUB (JSZip), PDF (pdf.js) and TXT into chapters of sentences. For PDFs it rebuilds paragraphs, removes running headers, page numbers and footnote markers, and uses the PDF outline for chapters.
 - **`js/tts-engine.js`** sends one sentence at a time to Kokoro and keeps 3 sentences ready ahead. It plays them back-to-back on the Web Audio clock with no gaps. Skipping cancels stale requests (`AbortController`). Audio buffers are released after playing, so no object URLs leak.
 - **`js/reader-view.js`** paginates with CSS columns: two columns on wide windows, one on narrow ones. Pages slide horizontally when they turn.
-- **`js/storage.js`** keeps everything in IndexedDB in the browser profile you use. Different browsers keep separate libraries.
+- **`js/storage.js`** keeps the library in IndexedDB. **`js/sync.js`** merges reading positions, notes, stats, settings and the open book with `Books/.bookshelf-state.json` (through `/api/state`); the newest change wins.
 - All libraries (`vendor/`) and fallback fonts (`assets/fonts/`: EB Garamond, Literata, Inter, all OFL) are bundled, so the app works with no internet. Charter, Iowan, New York, Palatino, Baskerville, Georgia and San Francisco come with macOS.
 - The server listens on 127.0.0.1 only, checks the `Host` and `Origin` headers, serves only whitelisted folders, and sends a strict Content-Security-Policy. Book text is never inserted as HTML.
 

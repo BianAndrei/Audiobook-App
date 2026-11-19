@@ -47,6 +47,7 @@ export class ReaderView extends EventTarget {
   }
 
   close() {
+    this.restingAnchor = null;
     this.cancelAnimation();
     this.revokeImages(this.imageUrls);
     this.imageUrls = [];
@@ -316,6 +317,7 @@ export class ReaderView extends EventTarget {
     if (this.isScroll) return;
     this.flow.style.transform = this.translateFor(this.view);
     this.updateFolios();
+    this.restingAnchor = this.pageAnchor();
     if (emit) this.emitPage();
   }
 
@@ -327,7 +329,18 @@ export class ReaderView extends EventTarget {
   }
 
   emitPage() {
-    this.dispatchEvent(new CustomEvent("page", { detail: { c: this.chapter, s: this.firstVisibleSentence() } }));
+    if (!this.isScroll) this.restingAnchor = this.pageAnchor();
+    this.dispatchEvent(new CustomEvent("page", { detail: { c: this.chapter, s: this.firstVisibleSentence(), anchor: this.pageAnchor() } }));
+  }
+
+  /** A sentence that starts on this page, so reopening at it lands on this exact page (the first
+   *  visible sentence may have begun on the previous page). */
+  pageAnchor() {
+    const first = this.firstVisibleSentence();
+    if (this.isScroll || !this.spans.length) return first;
+    const firstCol = this.view * this.perView, nextCol = firstCol + this.perView;
+    const i = this.search(j => this.colOf(j) >= firstCol);
+    return this.spans[i] && this.colOf(i) < nextCol ? i : first;
   }
 
   // ---- geometry ----------------------------------------------------------
@@ -494,7 +507,9 @@ export class ReaderView extends EventTarget {
     new ResizeObserver(() => {
       if (!this.book) return;
       clearTimeout(resizeTimer);
-      const anchor = this.firstVisibleSentence();
+      // By now the text has already reflowed to the new size, so measuring "what's on screen"
+      // would be off by a page; use the sentence remembered from when the page was last shown.
+      const anchor = this.isScroll ? this.firstVisibleSentence() : (this.restingAnchor ?? this.firstVisibleSentence());
       resizeTimer = setTimeout(() => this.relayout(anchor), 120);
     }).observe(this.desk);
   }
